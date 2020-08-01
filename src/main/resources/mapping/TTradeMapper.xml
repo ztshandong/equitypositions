@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd" >
+<mapper namespace="com.zhangtao.mapper.TTradeMapper">
+    <resultMap id="BaseResultMap" type="com.zhangtao.entity.TradeEntity">
+        <id column="TRANSACTIONID" property="transactionId" jdbcType="INTEGER"/>
+        <result column="TRADEID" property="tradeId" jdbcType="INTEGER"/>
+        <result column="VERSION" property="version" jdbcType="INTEGER"/>
+        <result column="SECURITYCODE" property="securityCode" jdbcType="VARCHAR"/>
+        <result column="QUANTITY" property="quantity" jdbcType="INTEGER"/>
+        <result column="DML" property="dml" jdbcType="VARCHAR"/>
+        <result column="OPT" property="opt" jdbcType="VARCHAR"/>
+    </resultMap>
+
+    <sql id="Base_Column_List">
+            TRANSACTIONID,
+            TRADEID,
+            VERSION,
+            SECURITYCODE,
+            QUANTITY,
+            DML,
+            OPT
+    </sql>
+
+    <select id="select" resultMap="BaseResultMap">
+        SELECT
+        <include refid="Base_Column_List"/>
+        FROM TRANSACTIONS
+        WHERE TRADEID = #{tradeId,jdbcType=INTEGER} AND VERSION = #{version,jdbcType=INTEGER}
+    </select>
+
+    <insert id="insert" parameterType="TradeEntity">
+        INSERT INTO TRANSACTIONS (TRANSACTIONID, TRADEID, VERSION, SECURITYCODE, QUANTITY, DML, OPT)
+        VALUES ( #{transactionId,jdbcType=INTEGER}
+        , #{tradeId,jdbcType=INTEGER}
+        , #{version,jdbcType=INTEGER}
+        , #{securityCode,jdbcType=VARCHAR}
+        , #{quantity,jdbcType=INTEGER}
+        , #{dml,jdbcType=VARCHAR}
+        , #{opt,jdbcType=VARCHAR})
+    </insert>
+
+</mapper>
