@@ -40,7 +40,7 @@ INSERT INTO SECURITYCODETB (SECURITYCODE) VALUES('REL'),('ITC'),('INF');
 
 **4.service 的updatePosition方法包含核心逻辑，对并发及数据重复发送及数据到达无序的情况都有做处理，详见代码注释。使用hashMap保存计算后的position数据，未做持久化处理，服务重启后计算结果会丢失。**
 
-5.使用编程式事务保存本地存根数据，主键与唯一索引保证操作幂等性。ORM使用Mybatis。
+5.使用编程式事务保存本地存根数据，主键与唯一索引保证操作幂等性。ORM使用Mybatis，使用redis作为缓存。
 
 6.使用重入锁防止并发问题。
 

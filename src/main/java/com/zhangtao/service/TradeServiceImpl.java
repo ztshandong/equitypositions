@@ -1,12 +1,16 @@
 package com.zhangtao.service;
 
+import com.alibaba.fastjson.JSON;
 import com.zhangtao.entity.DMLEnum;
 import com.zhangtao.entity.OptEnum;
+import com.zhangtao.entity.StrHelper;
 import com.zhangtao.entity.TradeEntity;
 import com.zhangtao.log.LogUtil;
 import com.zhangtao.mapper.TSecurityCodeMapper;
 import com.zhangtao.mapper.TTradeMapper;
+import com.zhangtao.redis.ZtJedisUtils;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.connection.jedis.JedisUtils;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.TransactionStatus;
@@ -15,8 +19,14 @@ import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.bind.annotation.GetMapping;
 
 import javax.annotation.PostConstruct;
+import javax.annotation.Resource;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -38,6 +48,9 @@ public class TradeServiceImpl implements TradeService {
     TSecurityCodeMapper tSecurityCodeMapper;
 
     @Autowired
+    private ZtJedisUtils jedis;
+
+    @Autowired
     JdbcTemplate jdbcTemplate;
 
     @Autowired
@@ -45,6 +58,10 @@ public class TradeServiceImpl implements TradeService {
 
     //TODO securityCodeMap当数据变化时应同步更新缓存
     HashMap<String, String> securityCodeMap = new HashMap<>();
+
+    HashMap<String, String> dmlMap = new HashMap<>();
+
+    HashMap<String, String> optMap = new HashMap<>();
 
     //TODO 下面的几个HashMap数据应该持久化保存，服务启动时重新加载
     //记录position
@@ -68,22 +85,54 @@ public class TradeServiceImpl implements TradeService {
         for (String securityCode : securityCodes) {
             securityCodeMap.put(securityCode, securityCode);
         }
+
+        for (DMLEnum e : DMLEnum.values()) {
+            dmlMap.put(e.getStrValue(), e.getStrValue());
+        }
+
+        for (OptEnum e : OptEnum.values()) {
+            optMap.put(e.getStrValue(), e.getStrValue());
+        }
     }
 
+    /**
+     * @param tradeEntity :
+     * @return :  java.util.HashMap<java.lang.String,java.lang.Integer>
+     * @author :  zhangtao
+     * @createDate :  2020/8/4 15:40
+     * @description :
+     * 1.INSERT    根据Buy或Sell增加或减少
+     * 2.UPDATE    查找当前tradeId的上一次操作记录，计算差值，然后更新
+     * 3.CANCLE    查找当前tradeId的所有操作记录，根据版本号从大到小排序，依次反向操作，遇到UPDATE后退出即可
+     * @updateUser :
+     * @updateDate :
+     * @updateRemark :
+     */
     @Override
     public HashMap<String, Integer> updatePosition(TradeEntity tradeEntity) {
 
         //查询本地存根
         TradeEntity transactionsEntity = select(tradeEntity.getTradeId(), tradeEntity.getVersion());
 
+        //先做数据合法性校验再保存，否则会保存非法数据
         if (!securityCodeMap.containsKey(tradeEntity.getSecurityCode())) {
             LogUtil.log("非法的SecurityCode");
             return positionMap;
         }
-        //TODO 应该先做数据合法性校验再保存，否则会保存非法数据
+
+        if (!dmlMap.containsKey(tradeEntity.getDml())) {
+            LogUtil.log("非法的DML类型");
+            return positionMap;
+        }
+
+        if (!optMap.containsKey(tradeEntity.getOpt())) {
+            LogUtil.log("非法的Opt类型");
+            return positionMap;
+        }
+
         //本地存根没有，说明是新数据，即使是迟到的数据，也需要保存，使用数据库索引保证唯一性
         if (transactionsEntity == null && insert(tradeEntity) == 1) {
-            //处理position数据，防止数据到达的顺序错误，需要加锁
+            //处理position数据，防止数据到达的顺序错误，需要加锁，必要时可使用分布式锁
             versionLock.lock();
             try {
                 //查询trade是否被cancel
@@ -101,7 +150,7 @@ public class TradeServiceImpl implements TradeService {
                 //获取最后一次的insert操作版本
                 Integer insertVersion = insertVersionMap.get(tradeEntity.getTradeId());
 
-                //首先处理cancel类型，最简单，数据清零即可
+                //处理cancel类型
                 if (DMLEnum.CANCEL.getStrValue().equals(tradeEntity.getDml())) {
                     //TODO insertVersion == null 应等待一段时间后做二次校验，超过重试次数上限后需做额外处理
                     //当前cancel操作版本号最大时才可以清零
@@ -111,21 +160,109 @@ public class TradeServiceImpl implements TradeService {
                     b = b & (insertVersion == null || insertVersion < tradeEntity.getVersion());
 
                     if (b) {
+                        //获取当前SecurityCode对应的Quantity
+                        Integer oldQuantityObj = positionMap.get(tradeEntity.getSecurityCode());
+                        int oldQuantity = oldQuantityObj == null ? 0 : oldQuantityObj;
+
+                        //TODO 如果数据到达顺序错误，这里拿到的值可能不完整，需要进一步优化
+                        //获取当前tradeId的所有历史记录
+                        Set<String> set = jedis.smembers(StrHelper.TRADEID + tradeEntity.getTradeId());
+                        List<TradeEntity> list = new ArrayList<>();
+                        for (String s : set) {
+                            list.add(JSON.parseObject(s, TradeEntity.class));
+                        }
+                        //按照版本号倒序排序
+                        list.sort(Comparator.comparing(TradeEntity::getVersion).reversed());
+
+                        //需要处理的差值
+                        int diffQuantity = 0;
+
+                        TradeEntity tradeEntity1 = null;
+                        for (int i = 0, j = list.size(); i < j; i++) {
+                            tradeEntity1 = list.get(i);
+
+                            //如果是insert，则将数据反向操作一遍即可，原来buy的减掉，原来sell的加回去
+                            //但如果碰到update，将数据反向操作完成后，不可继续循环，应该退出
+                            if (tradeEntity1.getVersion() < tradeEntity.getVersion()) {
+                                if (OptEnum.BUY.getStrValue().equals(tradeEntity1.getOpt())) {
+                                    diffQuantity -= tradeEntity1.getQuantity();
+                                } else {
+                                    diffQuantity += tradeEntity1.getQuantity();
+                                }
+                                if (DMLEnum.UPDATE.getStrValue().equals(tradeEntity1.getDml())) {
+                                    break;
+                                }
+                            }
+                        }
+
                         //记录trade已被cancel
                         cancelVersionMap.put(tradeEntity.getTradeId(), tradeEntity.getVersion());
-                        //position对应的securityCode数据清零
-                        positionMap.put(tradeEntity.getSecurityCode(), 0);
+                        //更新positionMap的数据，旧值加上差值
+                        positionMap.put(tradeEntity.getSecurityCode(), oldQuantity + diffQuantity);
                     }
                 } else if (DMLEnum.UPDATE.getStrValue().equals(tradeEntity.getDml())) {
-                    //然后处理update类型，更新，需要判断是否在cancel之后到达，同时要与之前的update和insert操作对比
+
+                    //处理update类型，更新，需要判断是否在cancel之后到达，同时要与之前的update和insert操作对比
                     //之前没有update或者是在上次update之后的操作
                     b = (updateVersion == null || updateVersion < tradeEntity.getVersion());
                     //update操作先于insert到达，或者上次insert之后的操作
                     b = b & (insertVersion == null || insertVersion < tradeEntity.getVersion());
 
                     if (b) {
-                        //更新positionMap的数据
-                        positionMap.put(tradeEntity.getSecurityCode(), tradeEntity.getQuantity());
+                        //获取当前SecurityCode对应的Quantity
+                        Integer oldQuantityObj = positionMap.get(tradeEntity.getSecurityCode());
+                        int oldQuantity = oldQuantityObj == null ? 0 : oldQuantityObj;
+
+                        //本次传入的Quantity
+                        int curQuantity = tradeEntity.getQuantity();
+
+                        //TODO 如果数据到达顺序错误，这里可能拿不到值，需要进一步优化
+                        //获取当前tradeId的上一个版本的历史记录
+                        Map<String, String> map = jedis.hgetAll(StrHelper.TRADEID + tradeEntity.getTradeId() + StrHelper.VERSION + (tradeEntity.getVersion() - 1));
+                        //上一次操作的Quantity
+                        int lastQuantity = 0;
+                        try {
+                            lastQuantity = Integer.parseInt(map.get(StrHelper.QUANTITY));
+                        } catch (Exception e) {
+
+                        }
+
+                        //需要处理的差值
+                        int diffQuantity = 0;
+
+                        //如果更改了SecurityCode就不能靠历史记录了，直接增加或减少Quantity
+                        //TODO 原来的SecurityCode数据未做处理
+                        if (!tradeEntity.getSecurityCode().equals(map.get(StrHelper.SECURITY_CODE))) {
+                            if (OptEnum.BUY.getStrValue().equals(tradeEntity.getOpt())) {
+                                diffQuantity = curQuantity;
+                            } else if (OptEnum.SELL.getStrValue().equals(tradeEntity.getOpt())) {
+                                diffQuantity = -curQuantity;
+                            } else {
+                                LogUtil.log("UPDATE非法OPT操作");
+                            }
+                        } else {
+                            //未更改SecurityCode，分四种情况计算差值
+                            //上一次是buy
+                            if (OptEnum.BUY.getStrValue().equals(map.get(StrHelper.OPT))) {
+                                if (OptEnum.BUY.getStrValue().equals(tradeEntity.getOpt())) {
+                                    diffQuantity = curQuantity - lastQuantity;
+                                } else if (OptEnum.SELL.getStrValue().equals(tradeEntity.getOpt())) {
+                                    diffQuantity = -curQuantity - lastQuantity;
+                                } else {
+                                    LogUtil.log("UPDATE非法OPT操作");
+                                }
+                            } else { //上一次是sell
+                                if (OptEnum.BUY.getStrValue().equals(tradeEntity.getOpt())) {
+                                    diffQuantity = curQuantity + lastQuantity;
+                                } else if (OptEnum.SELL.getStrValue().equals(tradeEntity.getOpt())) {
+                                    diffQuantity = lastQuantity - curQuantity;
+                                } else {
+                                    LogUtil.log("UPDATE非法OPT操作");
+                                }
+                            }
+                        }
+                        //更新positionMap的数据，旧值加上差值
+                        positionMap.put(tradeEntity.getSecurityCode(), oldQuantity + diffQuantity);
                         //记录此次update的version
                         updateVersionMap.put(tradeEntity.getTradeId(), tradeEntity.getVersion());
                     }
@@ -152,7 +289,7 @@ public class TradeServiceImpl implements TradeService {
                             insertVersionMap.put(tradeEntity.getTradeId(), tradeEntity.getVersion());
                         } else {
                             //TODO 也可以自定义枚举@EnumValidator，或者删除非法数据
-                            LogUtil.log("非法OPT操作");
+                            LogUtil.log("INSERT非法OPT操作");
                         }
                     }
                 } else {
@@ -203,6 +340,20 @@ public class TradeServiceImpl implements TradeService {
                 }
             }
         });
+        if (row == 1) {
+            //TODO 暂时不考虑redis保存失败的情况
+            //使用tradeId为key，记录所有历史操作 cancel的时候遍历这个set
+            jedis.sadd(StrHelper.TRADEID + tradeEntity.getTradeId(), JSON.toJSONString(tradeEntity));
+
+            //使用tradeId+version为key，记录每一次操作
+            //update的时候根据tradeId与version查询这个HashMap
+            HashMap<String, String> map = new HashMap<>();
+            map.put(StrHelper.SECURITY_CODE, tradeEntity.getSecurityCode() + "");
+            map.put(StrHelper.QUANTITY, tradeEntity.getQuantity() + "");
+            map.put(StrHelper.DML, tradeEntity.getDml());
+            map.put(StrHelper.OPT, tradeEntity.getOpt());
+            jedis.hmset(StrHelper.TRADEID + tradeEntity.getTradeId() + StrHelper.VERSION + tradeEntity.getVersion(), map);
+        }
         return row;
     }
 

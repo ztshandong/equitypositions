@@ -140,4 +140,5 @@ public class TradeEntity {
                 ", opt='" + opt + '\'' +
                 '}';
     }
+
 }
